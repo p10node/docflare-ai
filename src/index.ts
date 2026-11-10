@@ -9,13 +9,13 @@
  *   GET    /api/sites/:siteId/status     indexing progress                           (admin)
  *   GET    /api/sites/:siteId/queries    recent chat log                             (admin)
  *   DELETE /api/sites/:siteId            remove a site and its vectors               (admin)
- *   POST   /api/chat                     RAG answer (JSON or SSE stream)             (public, origin-checked)
+ *   POST   /api/chat                     RAG answer (JSON or SSE stream)             (public, origin-checked, rate-limited)
  *   GET    /widget.js                    embeddable widget (also served as a static asset)
  *   GET    /admin                        admin UI (static asset public/admin.html)
  */
 import { Hono } from 'hono';
 import type { Context, MiddlewareHandler } from 'hono';
-import { Db, type SiteRow } from './db/schema';
+import { Db, emptyProgress, type SiteRow } from './db/schema';
 import {
   AiRateLimitError,
   CHAT_MODEL,
@@ -25,15 +25,15 @@ import {
   embedQuery,
   generateAnswer,
   generateAnswerStream,
-  iterateWorkersAiTokens,
   rerankChunks,
   textToWorkersAiStream,
   toSources,
 } from './services/ai';
 import { CrawlError } from './services/crawler';
 import { getProgress, processPendingPages, registerSite, removeSite } from './services/indexer';
+import { buildChatStream } from './services/stream';
 import { MAX_TOP_K, diversify, searchChunks } from './services/vectorize';
-import { cors, isOriginAllowed, parseAllowedOrigins } from './utils/cors';
+import { cors, isOriginAllowed, normalizeDomain, parseAllowedOrigins } from './utils/cors';
 import { timingSafeEqual } from './utils/hash';
 import {
   HttpError,
@@ -44,7 +44,6 @@ import {
   type ChatResponse,
   type Env,
   type IndexSiteRequest,
-  type Source,
 } from './types';
 
 const SITE_ID_PATTERN = /^[a-z0-9][a-z0-9_-]{0,63}$/i;
@@ -54,6 +53,15 @@ const NO_CONTEXT_ANSWER =
   "I couldn't find anything about that in this documentation. Try rephrasing your question or using different keywords.";
 /** Without the reranker, over-fetch this many times TOP_K so the per-page cap still has candidates. */
 const OVERFETCH_FACTOR = 3;
+/**
+ * Example ADMIN_TOKEN values shipped in .dev.vars.example (which the Deploy to Cloudflare wizard
+ * pre-fills). They, and anything shorter than MIN_ADMIN_TOKEN_CHARS, only work on localhost.
+ */
+const PLACEHOLDER_ADMIN_TOKENS = new Set(['dev-token-change-me']);
+const MIN_ADMIN_TOKEN_CHARS = 16;
+/** Window for DAILY_CHAT_LIMIT. */
+const CHAT_LIMIT_WINDOW_HOURS = 24;
+const AI_ERROR_MESSAGE = 'The AI model is unavailable right now. Please try again later.';
 
 // ---------------------------------------------------------------------------
 // Configuration helpers
@@ -78,6 +86,8 @@ function loadConfig(env: Env): AppConfig {
     topK: intVar(env.TOP_K, 4, 1, 20),
     rerank: boolVar(env.RERANK, true),
     allowedOrigins: parseAllowedOrigins(env.ALLOWED_ORIGINS),
+    dailyChatLimit: intVar(env.DAILY_CHAT_LIMIT, 250, 0, 1_000_000),
+    queryRetentionDays: intVar(env.QUERY_RETENTION_DAYS, 90, 0, 36_500),
   };
 }
 
@@ -128,6 +138,22 @@ function sanitizeHistory(value: unknown): ChatMessage[] {
     .slice(-MAX_HISTORY_ENTRIES);
 }
 
+/** The site domain from the request body, or null when it was not given. */
+function optionalDomain(value: unknown): string | null {
+  if (typeof value !== 'string' || !value.trim()) return null;
+  const domain = normalizeDomain(value);
+  if (!domain) {
+    throw new HttpError(400, 'domain must be a hostname such as "docs.example.com" or "*.example.com"', 'invalid_domain');
+  }
+  return domain;
+}
+
+/** True for requests served by `wrangler dev` (the URL host is the one Cloudflare routed on, not spoofable). */
+function isLocalRequest(url: string): boolean {
+  const host = new URL(url).hostname;
+  return host === 'localhost' || host === '127.0.0.1' || host === '[::1]';
+}
+
 async function requireSite(db: Db, siteId: string): Promise<SiteRow> {
   const site = await db.getSite(siteId);
   if (!site) throw new HttpError(404, `Site "${siteId}" is not registered`, 'site_not_found');
@@ -148,6 +174,17 @@ const requireAdmin: MiddlewareHandler<AppBindings> = async (c, next) => {
       'admin_token_missing',
     );
   }
+  if (
+    (expected.length < MIN_ADMIN_TOKEN_CHARS || PLACEHOLDER_ADMIN_TOKENS.has(expected)) &&
+    !isLocalRequest(c.req.url)
+  ) {
+    throw new HttpError(
+      503,
+      `ADMIN_TOKEN is the example value or shorter than ${MIN_ADMIN_TOKEN_CHARS} characters. ` +
+        'Set a long random one with `bunx wrangler secret put ADMIN_TOKEN` (e.g. `openssl rand -hex 32`).',
+      'admin_token_weak',
+    );
+  }
   const header = c.req.header('Authorization') ?? '';
   const token = header.startsWith('Bearer ') ? header.slice(7).trim() : '';
   if (!token || !timingSafeEqual(token, expected)) {
@@ -166,6 +203,7 @@ app.use('*', cors());
 
 app.onError((err, c) => {
   if (err instanceof HttpError) {
+    if (err.status === 429) c.header('Retry-After', '60');
     return c.json({ error: err.message, code: err.code }, err.status as 400);
   }
   if (err instanceof AiRateLimitError) {
@@ -176,9 +214,10 @@ app.onError((err, c) => {
     return c.json({ error: err.message, code: 'crawl_error' }, 422);
   }
   if (err.name === 'AiError') {
-    // Workers AI failures (model deprecated, unavailable, bad input) are surfaced instead of a bare 500.
+    // Workers AI failures (model deprecated, unavailable, bad input): a 502 instead of a bare 500. The
+    // details go to the logs only; /api/chat is public.
     console.error(JSON.stringify({ event: 'ai_error', message: err.message }));
-    return c.json({ error: `Workers AI error: ${err.message}`, code: 'ai_error' }, 502);
+    return c.json({ error: AI_ERROR_MESSAGE, code: 'ai_error' }, 502);
   }
   console.error(JSON.stringify({ event: 'unhandled_error', message: err.message, stack: err.stack }));
   return c.json({ error: 'Internal server error', code: 'internal_error' }, 500);
@@ -224,7 +263,7 @@ sites.get('/', async (c) => {
   return c.json({
     sites: rows.map((site) => ({
       ...site,
-      progress: progress.get(site.id) ?? { siteId: site.id, total: 0, pending: 0, indexed: 0, failed: 0 },
+      progress: progress.get(site.id) ?? emptyProgress(site.id),
     })),
   });
 });
@@ -236,10 +275,13 @@ sites.post('/index', async (c) => {
 
   const siteId = requireSiteId(body.siteId);
   const sitemap = requireHttpUrl(body.sitemapUrl, 'sitemapUrl');
-  const domain = (typeof body.domain === 'string' && body.domain.trim()
-    ? body.domain.trim().replace(/^https?:\/\//, '').replace(/[/:].*$/, '')
-    : sitemap.hostname
-  ).toLowerCase();
+  // Without an explicit domain a re-index keeps the registered one (a custom or wildcard domain must
+  // survive "Re-crawl sitemap"); a new site defaults to the sitemap host.
+  const existing = await new Db(c.env.DB).getSite(siteId);
+  const domain = optionalDomain(body.domain) ?? existing?.domain ?? normalizeDomain(sitemap.hostname);
+  if (!domain) {
+    throw new HttpError(400, 'The sitemap host is not a plain hostname; pass "domain" explicitly', 'invalid_domain');
+  }
 
   const registered = await registerSite(c.env, siteId, sitemap.toString(), domain, config.maxPages);
 
@@ -302,57 +344,6 @@ app.route('/api/sites', sites);
 
 // --- Chat --------------------------------------------------------------------
 
-/** Encode one custom SSE event. */
-function sseEvent(event: string, data: unknown): Uint8Array {
-  return new TextEncoder().encode(`event: ${event}\ndata: ${JSON.stringify(data)}\n\n`);
-}
-
-/**
- * Re-emit Workers AI tokens as our own SSE protocol:
- *   event: meta   {id, sources}
- *   event: token  {text}
- *   event: done   {id}
- *   event: error  {message}
- * The full answer is collected and handed to `onComplete` for persistence.
- */
-function buildChatStream(
-  id: string,
-  sources: Source[],
-  aiStream: ReadableStream<Uint8Array>,
-  onComplete: (answer: string) => Promise<void>,
-): { stream: ReadableStream<Uint8Array>; finished: Promise<void> } {
-  let resolveFinished: () => void = () => {};
-  const finished = new Promise<void>((resolve) => {
-    resolveFinished = resolve;
-  });
-
-  const stream = new ReadableStream<Uint8Array>({
-    async start(controller) {
-      let answer = '';
-      controller.enqueue(sseEvent('meta', { id, sources }));
-      try {
-        for await (const token of iterateWorkersAiTokens(aiStream)) {
-          answer += token;
-          controller.enqueue(sseEvent('token', { text: token }));
-        }
-        controller.enqueue(sseEvent('done', { id }));
-      } catch (err) {
-        const message = err instanceof Error ? err.message : 'Stream interrupted';
-        controller.enqueue(sseEvent('error', { message }));
-      } finally {
-        controller.close();
-        try {
-          await onComplete(answer.trim());
-        } finally {
-          resolveFinished();
-        }
-      }
-    },
-  });
-
-  return { stream, finished };
-}
-
 app.post('/api/chat', async (c) => {
   const config = loadConfig(c.env);
   const body = await readJson<Partial<ChatRequest>>(c);
@@ -366,6 +357,14 @@ app.post('/api/chat', async (c) => {
   const history = sanitizeHistory(body.history);
   const wantsStream = body.stream === true;
 
+  // Abuse guard 1: per site + client burst limit. Runs before any D1 read; the Origin check below does
+  // not stop non-browser clients, so this is what keeps a script from draining the Workers AI quota.
+  if (c.env.CHAT_RATE_LIMITER) {
+    const client = c.req.header('CF-Connecting-IP') ?? 'unknown';
+    const { success } = await c.env.CHAT_RATE_LIMITER.limit({ key: `${siteId}:${client}` });
+    if (!success) throw new HttpError(429, 'Too many questions. Please wait a minute and try again.', 'rate_limited');
+  }
+
   const db = new Db(c.env.DB);
   const site = await requireSite(db, siteId);
 
@@ -373,6 +372,19 @@ app.post('/api/chat', async (c) => {
   const origin = c.req.header('Origin');
   if (!isOriginAllowed(origin, site.domain, config.allowedOrigins)) {
     throw new HttpError(403, `Origin ${origin} is not allowed for site "${siteId}"`, 'origin_not_allowed');
+  }
+
+  // Abuse guard 2: per-site daily budget, so one site (or a distributed client) cannot use up the
+  // Workers AI quota shared by every site on this deployment.
+  if (
+    config.dailyChatLimit > 0 &&
+    (await db.countQueriesSince(siteId, CHAT_LIMIT_WINDOW_HOURS)) >= config.dailyChatLimit
+  ) {
+    throw new HttpError(
+      429,
+      'This documentation assistant reached its daily question limit. Please try again later.',
+      'daily_limit_reached',
+    );
   }
 
   // Retrieval: vector candidates → (cross-encoder rerank) → at most MAX_CHUNKS_PER_PAGE per page.
@@ -423,13 +435,25 @@ app.post('/api/chat', async (c) => {
 export default {
   fetch: app.fetch,
 
-  /** Cron trigger: crawl the next batch of pending pages across all sites. */
-  async scheduled(_controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
+  /**
+   * Cron trigger (every minute): crawl the next batch of pending pages across all sites, and once an
+   * hour delete chat log rows older than QUERY_RETENTION_DAYS.
+   */
+  async scheduled(controller: ScheduledController, env: Env, ctx: ExecutionContext): Promise<void> {
     const config = loadConfig(env);
-    ctx.waitUntil(
-      processPendingPages(env, null, config.indexBatchSize).catch((err: unknown) => {
-        console.error(JSON.stringify({ event: 'cron.failed', message: err instanceof Error ? err.message : String(err) }));
-      }),
-    );
+    const logFailure = (event: string) => (err: unknown) => {
+      console.error(JSON.stringify({ event, message: err instanceof Error ? err.message : String(err) }));
+    };
+    ctx.waitUntil(processPendingPages(env, null, config.indexBatchSize).then(() => {}, logFailure('cron.failed')));
+
+    if (config.queryRetentionDays > 0 && new Date(controller.scheduledTime).getUTCMinutes() === 0) {
+      ctx.waitUntil(
+        new Db(env.DB)
+          .pruneQueries(config.queryRetentionDays)
+          .then((deleted) => {
+            if (deleted > 0) console.log(JSON.stringify({ event: 'queries.pruned', deleted }));
+          }, logFailure('queries.prune_failed')),
+      );
+    }
   },
 } satisfies ExportedHandler<Env>;

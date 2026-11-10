@@ -4,15 +4,19 @@
  */
 import type { ChatMessage, RetrievedChunk, Source } from '../types';
 
-export const EMBEDDING_MODEL = '@cf/baai/bge-small-en-v1.5';
+/**
+ * Multilingual embedding model (100+ languages): a Vietnamese question finds Vietnamese or English pages.
+ * Changing it requires a Vectorize index with EMBEDDING_DIMENSIONS dimensions and a re-crawl of every site.
+ */
+export const EMBEDDING_MODEL = '@cf/baai/bge-m3';
 // `@cf/meta/llama-3.1-8b-instruct` was deprecated by Cloudflare on 2026-05-30 (AiError 5028); the fp8 build is the drop-in.
 export const CHAT_MODEL = '@cf/meta/llama-3.1-8b-instruct-fp8';
 /** Cross-encoder used to re-order the vector-search candidates before they reach the LLM. */
 export const RERANK_MODEL = '@cf/baai/bge-reranker-base';
-export const EMBEDDING_DIMENSIONS = 384;
+export const EMBEDDING_DIMENSIONS = 1024;
 
-/** bge-small accepts up to 100 texts per call. */
-const EMBED_BATCH_SIZE = 100;
+/** Texts per embedding call. bge-m3 documents no item limit; 50 keeps each request modest. */
+const EMBED_BATCH_SIZE = 50;
 /** Longest passage handed to the reranker (its window is ~512 tokens for query + passage). */
 const RERANK_MAX_CHARS = 2000;
 /** Generation settings tuned for factual, grounded answers. */
@@ -74,7 +78,7 @@ function wrapAiError(err: unknown): never {
 // Embeddings
 // ---------------------------------------------------------------------------
 
-/** Embed a list of texts (batched). Returns one 384-dim vector per input, in order. */
+/** Embed a list of texts (batched). Returns one EMBEDDING_DIMENSIONS vector per input, in order. */
 export async function embedTexts(ai: Ai, texts: string[]): Promise<number[][]> {
   const runner = ai as unknown as AiRunner;
   const vectors: number[][] = [];
@@ -83,7 +87,7 @@ export async function embedTexts(ai: Ai, texts: string[]): Promise<number[][]> {
     const batch = texts.slice(i, i + EMBED_BATCH_SIZE);
     let output: EmbeddingOutput;
     try {
-      output = (await runner.run(EMBEDDING_MODEL, { text: batch })) as EmbeddingOutput;
+      output = (await runner.run(EMBEDDING_MODEL, { text: batch, truncate_inputs: true })) as EmbeddingOutput;
     } catch (err) {
       wrapAiError(err);
     }
@@ -287,18 +291,24 @@ export function textToWorkersAiStream(text: string): ReadableStream<Uint8Array> 
 
 /**
  * Extract the `response` tokens from a Workers AI SSE byte stream and yield them as strings.
- * Handles chunk boundaries that split a line.
+ * Handles chunk boundaries that split a line and a last line without a trailing newline.
+ * Stopping early (consumer breaks out, `[DONE]`, error) cancels the upstream stream.
  */
 export async function* iterateWorkersAiTokens(stream: ReadableStream<Uint8Array>): AsyncGenerator<string> {
   const reader = stream.getReader();
   const decoder = new TextDecoder();
   let buffer = '';
+  let drained = false;
 
   try {
-    while (true) {
+    while (!drained) {
       const { done, value } = await reader.read();
-      if (done) break;
-      buffer += decoder.decode(value, { stream: true });
+      if (done) {
+        drained = true;
+        buffer += decoder.decode() + '\n';
+      } else {
+        buffer += decoder.decode(value, { stream: true });
+      }
 
       let newline: number;
       while ((newline = buffer.indexOf('\n')) >= 0) {
@@ -307,16 +317,17 @@ export async function* iterateWorkersAiTokens(stream: ReadableStream<Uint8Array>
         if (!line.startsWith('data:')) continue;
         const payload = line.slice(5).trim();
         if (payload === '[DONE]') return;
+        let token = '';
         try {
-          const parsed = JSON.parse(payload) as TextGenerationOutput;
-          const token = outputText(parsed);
-          if (token) yield token;
+          token = outputText(JSON.parse(payload) as TextGenerationOutput);
         } catch {
           // Ignore malformed keep-alive lines.
         }
+        if (token) yield token;
       }
     }
   } finally {
+    if (!drained) await reader.cancel().catch(() => {});
     reader.releaseLock();
   }
 }

@@ -29,13 +29,13 @@
   "cloudflare": {
     "bindings": {
       "VECTOR_INDEX": {
-        "description": "Vectorize index for `@cf/baai/bge-small-en-v1.5` embeddings: set **Dimensions = 384** and **Metric = cosine**. Any other shape breaks indexing."
+        "description": "Vectorize index for `@cf/baai/bge-m3` embeddings: set **Dimensions = 1024** and **Metric = cosine**. Any other shape breaks indexing."
       },
       "DB": {
         "description": "D1 database for sites, pages and chat history. Apply the schema once after the first deploy with `bun run db:migrate` (see README)."
       },
       "ADMIN_TOKEN": {
-        "description": "Bearer token for the `/api/sites/*` management routes and the `/admin` page. Replace the example value with a random one, e.g. `openssl rand -hex 32`."
+        "description": "Bearer token for the `/api/sites/*` management routes and the `/admin` page. Replace the example value with a random one of at least 16 characters, e.g. `openssl rand -hex 32`; the example value is refused outside localhost."
       }
     }
   },
@@ -50,7 +50,7 @@
     "db:create": "wrangler d1 create docflare-db",
     "db:migrate": "bun scripts/wrangler.ts d1 migrations apply DB --remote",
     "db:migrate:local": "wrangler d1 migrations apply DB --local",
-    "vectorize:create": "wrangler vectorize create docflare-index --dimensions=384 --metric=cosine",
+    "vectorize:create": "wrangler vectorize create docflare-index-m3 --dimensions=1024 --metric=cosine",
     "secret:admin": "wrangler secret put ADMIN_TOKEN",
     "cf-typegen": "wrangler types"
   },
@@ -59,7 +59,7 @@
   },
   "devDependencies": {
     "@cloudflare/workers-types": "^5.20261006.1",
-    "@types/bun": "latest",
+    "@types/bun": "1.4.2",
     "typescript": "^5.9.0",
     "wrangler": "^4.148.0"
   }

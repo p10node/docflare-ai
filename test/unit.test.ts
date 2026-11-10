@@ -28,7 +28,7 @@ import {
 } from '../src/services/crawler';
 import { buildChunkRecords } from '../src/services/indexer';
 import { diversify } from '../src/services/vectorize';
-import { hostnameMatches, isOriginAllowed, parseAllowedOrigins } from '../src/utils/cors';
+import { hostnameMatches, isOriginAllowed, normalizeDomain, parseAllowedOrigins } from '../src/utils/cors';
 import { pageIdFor, sha256Hex, timingSafeEqual } from '../src/utils/hash';
 import type { RetrievedChunk } from '../src/types';
 
@@ -271,6 +271,14 @@ describe('sitemap URL filtering', () => {
     expect(isSameSite('docs.example.com', 'example.com')).toBe(true);
     expect(isSameSite('example.com.evil.io', 'example.com')).toBe(false);
   });
+
+  test('isSameSite understands wildcard site domains and never matches an empty one', () => {
+    expect(isSameSite('api.example.com', '*.example.com')).toBe(true);
+    expect(isSameSite('example.com', '*.example.com')).toBe(true);
+    expect(isSameSite('example.org', '*.example.com')).toBe(false);
+    expect(isSameSite('evil.test.', '')).toBe(false);
+    expect(normalizePageUrl('https://docs.example.com/x', '*.example.com')).toBe('https://docs.example.com/x');
+  });
 });
 
 describe('CORS / origin policy', () => {
@@ -280,6 +288,15 @@ describe('CORS / origin policy', () => {
     expect(hostnameMatches('a.b.example.com', '*.example.com')).toBe(true);
     expect(hostnameMatches('example.com', '*.example.com')).toBe(true);
     expect(hostnameMatches('example.com.evil.io', 'example.com')).toBe(false);
+  });
+
+  test('normalizeDomain keeps hostnames and wildcards and rejects everything else', () => {
+    expect(normalizeDomain(' https://Docs.Example.com:8080/path ')).toBe('docs.example.com');
+    expect(normalizeDomain('*.example.com')).toBe('*.example.com');
+    expect(normalizeDomain('localhost')).toBe('localhost');
+    for (const bad of ['', 'https://', 'a..b', 'example.com.', '-a.com', 'exa mple.com', '*.', 'a.*.com']) {
+      expect(normalizeDomain(bad)).toBeNull();
+    }
   });
 
   test('isOriginAllowed enforces the site domain and the allow-list', () => {
@@ -299,8 +316,12 @@ describe('CORS / origin policy', () => {
 describe('hash utilities', () => {
   test('sha256Hex and pageIdFor are deterministic', async () => {
     expect(await sha256Hex('abc')).toBe('ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad');
-    expect(await pageIdFor('https://a.com/')).toHaveLength(24);
-    expect(await pageIdFor('https://a.com/')).toBe(await pageIdFor('https://a.com/'));
+    expect(await pageIdFor('docs', 'https://a.com/')).toHaveLength(24);
+    expect(await pageIdFor('docs', 'https://a.com/')).toBe(await pageIdFor('docs', 'https://a.com/'));
+  });
+
+  test('pageIdFor differs per site for the same URL', async () => {
+    expect(await pageIdFor('docs', 'https://a.com/')).not.toBe(await pageIdFor('docs-v2', 'https://a.com/'));
   });
 
   test('timingSafeEqual compares correctly', () => {
@@ -381,6 +402,16 @@ describe('Workers AI output parsing', () => {
       ]),
     );
     expect(tokens).toEqual(['4']);
+  });
+
+  test('iterateWorkersAiTokens keeps a last line that has no trailing newline', async () => {
+    const stream = new ReadableStream<Uint8Array>({
+      start(c) {
+        c.enqueue(new TextEncoder().encode('data: {"response":"a"}\n\ndata: {"response":"b"}'));
+        c.close();
+      },
+    });
+    expect(await collect(stream)).toEqual(['a', 'b']);
   });
 
   test('textToWorkersAiStream round-trips through iterateWorkersAiTokens', async () => {

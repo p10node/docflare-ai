@@ -6,7 +6,7 @@
 export interface Env {
   /** Workers AI binding - embeddings and text generation. */
   AI: Ai;
-  /** Vectorize index (384 dimensions, cosine). */
+  /** Vectorize index (1024 dimensions for bge-m3, cosine). */
   VECTOR_INDEX: VectorizeIndex;
   /** D1 database. */
   DB: D1Database;
@@ -25,6 +25,12 @@ export interface Env {
   TOP_K?: string;
   /** "false" disables the reranking stage (default on). */
   RERANK?: string;
+  /** Max answered questions per site in a rolling 24 hours ("0" = unlimited). */
+  DAILY_CHAT_LIMIT?: string;
+  /** Days of chat log kept in the `queries` table ("0" = keep forever). */
+  QUERY_RETENTION_DAYS?: string;
+  /** Workers Rate Limiting binding: per site + client IP burst limit on /api/chat. */
+  CHAT_RATE_LIMITER?: RateLimit;
 }
 
 /** Hono generic environment. */
@@ -38,6 +44,10 @@ export interface AppConfig {
   /** Rerank vector-search candidates with a cross-encoder before prompting. */
   rerank: boolean;
   allowedOrigins: string[];
+  /** 0 = unlimited. */
+  dailyChatLimit: number;
+  /** 0 = keep forever. */
+  queryRetentionDays: number;
 }
 
 // ---------------------------------------------------------------------------
@@ -49,7 +59,10 @@ export interface IndexSiteRequest {
   siteId: string;
   /** Absolute URL of the XML sitemap (or sitemap index). */
   sitemapUrl: string;
-  /** Hostname allowed to embed the widget. Defaults to the sitemap hostname. */
+  /**
+   * Hostname allowed to embed the widget ("docs.example.com" or "*.example.com"). Defaults to the
+   * domain already registered for this siteId, or the sitemap hostname for a new site.
+   */
   domain?: string;
   /** When true, also crawl a first batch of pages inline. Default false. */
   process?: boolean;
@@ -88,6 +101,8 @@ export interface IndexProgress {
   siteId: string;
   total: number;
   pending: number;
+  /** Claimed by a running cron tick or /process call. */
+  processing: number;
   indexed: number;
   failed: number;
 }

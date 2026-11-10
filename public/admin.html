@@ -97,7 +97,7 @@
         <form id="reg" class="row">
           <div class="field"><label for="siteId">siteId</label><input id="siteId" placeholder="my-docs" required pattern="[A-Za-z0-9][A-Za-z0-9_-]{0,63}"></div>
           <div class="field" style="flex:2"><label for="sitemap">sitemapUrl</label><input id="sitemap" type="url" placeholder="https://docs.example.com/sitemap.xml" required></div>
-          <div class="field"><label for="domain">domain (optional)</label><input id="domain" placeholder="docs.example.com"></div>
+          <div class="field"><label for="domain">domain (optional, kept on re-index)</label><input id="domain" placeholder="docs.example.com or *.example.com"></div>
           <button class="pri" type="submit">Queue pages</button>
         </form>
       </section>
@@ -149,7 +149,11 @@
           body: body ? JSON.stringify(body) : undefined
         }).then(function (r) {
           return r.json().catch(function () { return {}; }).then(function (j) {
-            if (!r.ok) throw new Error(j.error || (method + ' ' + path + ' failed (' + r.status + ')'));
+            if (!r.ok) {
+              var err = new Error(j.error || (method + ' ' + path + ' failed (' + r.status + ')'));
+              err.status = r.status; err.data = j;
+              throw err;
+            }
             return j;
           });
         });
@@ -160,15 +164,15 @@
       function renderSites(list) {
         if (!list.length) { sitesEl.innerHTML = '<div class="empty">No sites yet. Register one above.</div>'; return; }
         sitesEl.innerHTML = list.map(function (s) {
-          var p = s.progress, snippet = '<script src="' + base + '/widget.js" data-site-id="' + s.id + '" data-theme="auto" defer><\/script>';
+          var p = s.progress, pend = p.pending + (p.processing || 0), snippet = '<script src="' + base + '/widget.js" data-site-id="' + s.id + '" data-theme="auto" defer><\/script>';
           return '<div class="site" data-id="' + esc(s.id) + '">' +
             '<div class="top"><span class="id">' + esc(s.id) + '</span><span class="dom">' + esc(s.domain) + '</span>' +
               '<a class="mono" href="' + esc(s.sitemap_url) + '" target="_blank" rel="noopener">' + esc(s.sitemap_url) + '</a></div>' +
-            '<div class="bar"><i class="ok" style="width:' + pct(p.indexed, p.total) + '"></i><i class="er" style="width:' + pct(p.failed, p.total) + '"></i><i class="pe" style="width:' + pct(p.pending, p.total) + '"></i></div>' +
-            '<div class="stats"><span class="ok"><span class="dot"></span><b>' + p.indexed + '</b> indexed</span><span class="pe"><span class="dot"></span><b>' + p.pending + '</b> pending</span><span class="er"><span class="dot"></span><b>' + p.failed + '</b> failed</span><span><b>' + p.total + '</b> pages</span></div>' +
+            '<div class="bar"><i class="ok" style="width:' + pct(p.indexed, p.total) + '"></i><i class="er" style="width:' + pct(p.failed, p.total) + '"></i><i class="pe" style="width:' + pct(pend, p.total) + '"></i></div>' +
+            '<div class="stats"><span class="ok"><span class="dot"></span><b>' + p.indexed + '</b> indexed</span><span class="pe"><span class="dot"></span><b>' + pend + '</b> pending</span><span class="er"><span class="dot"></span><b>' + p.failed + '</b> failed</span><span><b>' + p.total + '</b> pages</span></div>' +
             '<div class="row">' +
-              '<button class="pri" data-act="all"' + (p.pending ? '' : ' disabled') + '>' + (running[s.id] ? 'Indexing…' : 'Index all pending') + '</button>' +
-              '<button data-act="batch"' + (p.pending ? '' : ' disabled') + '>Process one batch</button>' +
+              '<button class="pri" data-act="all"' + (pend && !running[s.id] ? '' : ' disabled') + '>' + (running[s.id] ? 'Indexing…' : 'Index all pending') + '</button>' +
+              '<button data-act="batch"' + (pend ? '' : ' disabled') + '>Process one batch</button>' +
               '<button data-act="recrawl">Re-crawl sitemap</button>' +
               '<button data-act="queries">Recent questions</button>' +
               '<button class="dng" data-act="delete">Delete</button>' +
@@ -184,27 +188,40 @@
           .catch(function (e) { log(e.message, 'e'); });
       }
 
+      function logResults(results) {
+        (results || []).forEach(function (r) { log(r.status + '  ' + r.url + (r.chunks ? '  (' + r.chunks + ' chunks)' : '') + (r.error ? '  ' + r.error : ''), r.status === 'failed' ? 'e' : 's'); });
+      }
+
+      // A rate-limited batch answers 429 with the pages it did finish; log those before rethrowing.
       function processBatch(id) {
-        return api('POST', '/api/sites/' + id + '/process').then(function (j) {
-          j.results.forEach(function (r) { log(r.status + '  ' + r.url + (r.chunks ? '  (' + r.chunks + ' chunks)' : '') + (r.error ? '  ' + r.error : ''), r.status === 'failed' ? 'e' : 's'); });
-          return j;
-        });
+        return api('POST', '/api/sites/' + id + '/process').then(function (j) { logResults(j.results); return j; },
+          function (e) { if (e.data) logResults(e.data.results); throw e; });
       }
 
       function indexAll(id) {
+        if (running[id]) return;
         running[id] = true;
         log('indexing ' + id + ' until the queue is empty…');
+        var waiting = false;
         (function loop() {
           processBatch(id).then(function (j) {
-            renderAfter();
-            if (j.rateLimited) { log('Workers AI rate limited, pausing 60s', 'e'); return setTimeout(loop, 60000); }
-            if (j.progress.pending > 0) return loop();
-            running[id] = false; log('done: ' + j.progress.indexed + ' indexed, ' + j.progress.failed + ' failed', 's'); loadSites();
-          }).catch(function (e) { running[id] = false; log(e.message, 'e'); loadSites(); });
+            loadSites();
+            var left = j.progress.pending + (j.progress.processing || 0);
+            if (!left) { running[id] = false; log('done: ' + j.progress.indexed + ' indexed, ' + j.progress.failed + ' failed', 's'); return loadSites(); }
+            // Nothing claimable: the remaining pages are being indexed by the cron trigger (or by an invocation that died, until its lease expires).
+            if (!j.processed) {
+              if (!waiting) log('waiting for ' + left + ' page(s) being indexed elsewhere…');
+              waiting = true;
+              return setTimeout(loop, 5000);
+            }
+            waiting = false;
+            loop();
+          }).catch(function (e) {
+            if (e.status === 429) { log('Workers AI rate limited, pausing 60s', 'e'); loadSites(); return setTimeout(loop, 60000); }
+            running[id] = false; log(e.message, 'e'); loadSites();
+          });
         })();
       }
-
-      function renderAfter() { loadSites(); }
 
       function showQueries(id, holder) {
         api('GET', '/api/sites/' + id + '/queries?limit=20').then(function (j) {
@@ -216,6 +233,10 @@
         }).catch(function (e) { log(e.message, 'e'); });
       }
 
+      function registered(j) {
+        return 'queued ' + j.queued + ' pages for ' + j.siteId + ' (' + j.domain + ')' + (j.removed ? ', removed ' + j.removed + ' no longer in the sitemap' : '');
+      }
+
       sitesEl.addEventListener('click', function (e) {
         var btn = e.target.closest('button[data-act]'); if (!btn) return;
         var card = btn.closest('.site'), id = card.getAttribute('data-id'), act = btn.getAttribute('data-act');
@@ -224,7 +245,7 @@
         if (act === 'queries') showQueries(id, $('.queries', card));
         if (act === 'recrawl') {
           var sm = $('.top a', card).getAttribute('href');
-          api('POST', '/api/sites/index', { siteId: id, sitemapUrl: sm }).then(function (j) { log('queued ' + j.queued + ' pages for ' + id, 's'); loadSites(); }).catch(function (er) { log(er.message, 'e'); });
+          api('POST', '/api/sites/index', { siteId: id, sitemapUrl: sm }).then(function (j) { log(registered(j), 's'); loadSites(); }).catch(function (er) { log(er.message, 'e'); });
         }
         if (act === 'delete' && confirm('Delete site "' + id + '", its pages, chat log and vectors?')) {
           api('DELETE', '/api/sites/' + id).then(function (j) { log('deleted ' + id + ' (' + j.vectorsDeleted + ' vectors)', 's'); loadSites(); }).catch(function (er) { log(er.message, 'e'); });
@@ -240,7 +261,7 @@
         e.preventDefault();
         var body = { siteId: $('#siteId').value.trim(), sitemapUrl: $('#sitemap').value.trim() };
         var d = $('#domain').value.trim(); if (d) body.domain = d;
-        api('POST', '/api/sites/index', body).then(function (j) { log('queued ' + j.queued + ' pages for ' + j.siteId + ' (' + j.domain + ')', 's'); loadSites(); })
+        api('POST', '/api/sites/index', body).then(function (j) { log(registered(j), 's'); loadSites(); })
           .catch(function (er) { log(er.message, 'e'); });
       };
 

@@ -6,11 +6,11 @@ All request and response bodies are JSON unless stated otherwise. Timestamps are
 
 ## Authentication
 
-| Route group                           | Requirement                                                                                                                                                |
-|---------------------------------------|------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| `/api/sites/*`                        | `Authorization: Bearer <ADMIN_TOKEN>` (the secret set with `wrangler secret put ADMIN_TOKEN`)                                                              |
-| `/api/chat`                           | No token. The request `Origin` must match the site's registered domain or an entry in `ALLOWED_ORIGINS`. Requests without an `Origin` header are accepted. |
-| `/api/health`, `/widget.js`, `/admin` | None (the admin page asks for the token in the browser and sends it as a bearer header)                                                                    |
+| Route group                           | Requirement                                                                                                                                                                                                                                                     |
+|---------------------------------------|-----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `/api/sites/*`                        | `Authorization: Bearer <ADMIN_TOKEN>` (the secret set with `wrangler secret put ADMIN_TOKEN`)                                                                                                                                                                   |
+| `/api/chat`                           | No token. The request `Origin` must match the site's registered domain or an entry in `ALLOWED_ORIGINS`. Requests without an `Origin` header are accepted. Rate-limited per site and client IP (`CHAT_RATE_LIMITER`) and per site per day (`DAILY_CHAT_LIMIT`). |
+| `/api/health`, `/widget.js`, `/admin` | None (the admin page asks for the token in the browser and sends it as a bearer header)                                                                                                                                                                         |
 
 ## Errors
 
@@ -20,16 +20,20 @@ Errors always have this shape:
 { "error": "human readable message", "code": "machine_readable_code" }
 ```
 
-| Status | Code                                                                 | When                                                    |
-|--------|----------------------------------------------------------------------|---------------------------------------------------------|
-| 400    | `invalid_json`, `invalid_site_id`, `invalid_url`, `invalid_question` | Malformed input                                         |
-| 401    | `unauthorized`                                                       | Missing/invalid admin token                             |
-| 403    | `origin_not_allowed`                                                 | `Origin` does not match the site's domain               |
-| 404    | `site_not_found`, `not_found`                                        | Unknown site / route                                    |
-| 422    | `crawl_error`                                                        | Sitemap unreachable, empty, or no same-domain HTML URLs |
-| 429    | `ai_rate_limited`                                                    | Workers AI quota or rate limit hit (`Retry-After: 60`)  |
-| 503    | `admin_token_missing`                                                | `ADMIN_TOKEN` secret not configured                     |
-| 500    | `internal_error`                                                     | Unexpected failure (details in Worker logs)             |
+| Status | Code                                                                                   | When                                                                                                     |
+|--------|----------------------------------------------------------------------------------------|----------------------------------------------------------------------------------------------------------|
+| 400    | `invalid_json`, `invalid_site_id`, `invalid_url`, `invalid_question`, `invalid_domain` | Malformed input                                                                                          |
+| 401    | `unauthorized`                                                                         | Missing/invalid admin token                                                                              |
+| 403    | `origin_not_allowed`                                                                   | `Origin` does not match the site's domain                                                                |
+| 404    | `site_not_found`, `not_found`                                                          | Unknown site / route                                                                                     |
+| 422    | `crawl_error`                                                                          | Sitemap unreachable, empty, or no same-domain HTML URLs                                                  |
+| 429    | `ai_rate_limited`                                                                      | Workers AI quota or rate limit hit (`Retry-After: 60`)                                                   |
+| 429    | `rate_limited`                                                                         | Too many questions from this client for this site in the last minute (`Retry-After: 60`)                 |
+| 429    | `daily_limit_reached`                                                                  | The site answered `DAILY_CHAT_LIMIT` questions in the last 24 hours (`Retry-After: 60`)                  |
+| 502    | `ai_error`                                                                             | Workers AI failed (model unavailable, bad input); details only in Worker logs                            |
+| 503    | `admin_token_missing`                                                                  | `ADMIN_TOKEN` secret not configured                                                                      |
+| 503    | `admin_token_weak`                                                                     | `ADMIN_TOKEN` is the `.dev.vars.example` value or shorter than 16 characters (allowed on localhost only) |
+| 500    | `internal_error`                                                                       | Unexpected failure (details in Worker logs)                                                              |
 
 `siteId` values are case-insensitive and normalised to lowercase. Pattern: `^[a-z0-9][a-z0-9_-]{0,63}$`.
 
@@ -43,7 +47,7 @@ Liveness probe.
 {
   "ok": true,
   "service": "docflare-ai",
-  "models": { "embedding": "@cf/baai/bge-small-en-v1.5", "chat": "@cf/meta/llama-3.1-8b-instruct-fp8" },
+  "models": { "embedding": "@cf/baai/bge-m3", "chat": "@cf/meta/llama-3.1-8b-instruct-fp8" },
   "time": "2026-10-07T09:00:00.000Z"
 }
 ```
@@ -52,7 +56,7 @@ Liveness probe.
 
 ## `GET /api/sites`
 
-All registered sites with their indexing progress. Powers the admin UI.
+All registered sites with their indexing progress. Powers the admin UI. `processing` counts pages claimed by a running cron tick or `/process` call; a claim that is not finished within 15 minutes (the invocation died) is handed out again, and a page that is claimed more than 3 times this way is marked `failed`.
 
 ```json
 {
@@ -62,7 +66,7 @@ All registered sites with their indexing progress. Powers the admin UI.
       "domain": "docs.example.com",
       "sitemap_url": "https://docs.example.com/sitemap.xml",
       "created_at": "2026-10-07 09:00:00",
-      "progress": { "siteId": "my-docs", "total": 142, "pending": 97, "indexed": 44, "failed": 1 }
+      "progress": { "siteId": "my-docs", "total": 142, "pending": 94, "processing": 3, "indexed": 44, "failed": 1 }
     }
   ]
 }
@@ -72,7 +76,7 @@ All registered sites with their indexing progress. Powers the admin UI.
 
 ## `POST /api/sites/index`
 
-Register (or refresh) a site and queue every HTML URL found in its sitemap. Existing pages are reset to `pending`, so calling this again re-crawls the whole site.
+Register (or refresh) a site and queue every HTML URL found in its sitemap. Existing pages are reset to `pending`, so calling this again re-crawls the whole site. Pages no longer in the sitemap (or past `MAX_PAGES`) are deleted together with their vectors and counted in `removed`.
 
 **Request**
 
@@ -85,12 +89,12 @@ Register (or refresh) a site and queue every HTML URL found in its sitemap. Exis
 }
 ```
 
-| Field        | Type    | Required | Notes                                                                                     |
-|--------------|---------|----------|-------------------------------------------------------------------------------------------|
-| `siteId`     | string  | yes      | Slug, 1-64 chars                                                                          |
-| `sitemapUrl` | string  | yes      | Absolute `http(s)` URL of a sitemap or sitemap index (`.xml` or `.xml.gz`)                |
-| `domain`     | string  | no       | Hostname allowed to embed the widget and crawl scope. Defaults to the sitemap's hostname. |
-| `process`    | boolean | no       | When `true`, also crawl one batch of pages inline before responding.                      |
+| Field        | Type    | Required | Notes                                                                                                                                                                                                               |
+|--------------|---------|----------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| `siteId`     | string  | yes      | Slug, 1-64 chars                                                                                                                                                                                                    |
+| `sitemapUrl` | string  | yes      | Absolute `http(s)` URL of a sitemap or sitemap index (`.xml` or `.xml.gz`)                                                                                                                                          |
+| `domain`     | string  | no       | Hostname allowed to embed the widget and crawl scope: `docs.example.com`, or `*.example.com` for the apex and every subdomain. Defaults to the domain already registered for `siteId`, else the sitemap's hostname. |
+| `process`    | boolean | no       | When `true`, also crawl one batch of pages inline before responding.                                                                                                                                                |
 
 **Response `202 Accepted`**
 
@@ -100,7 +104,8 @@ Register (or refresh) a site and queue every HTML URL found in its sitemap. Exis
   "domain": "docs.example.com",
   "sitemapUrl": "https://docs.example.com/sitemap.xml",
   "queued": 142,
-  "progress": { "siteId": "my-docs", "total": 142, "pending": 142, "indexed": 0, "failed": 0 },
+  "removed": 0,
+  "progress": { "siteId": "my-docs", "total": 142, "pending": 142, "processing": 0, "indexed": 0, "failed": 0 },
   "processed": null,
   "next": "Pending pages are crawled 3 at a time by the cron trigger. Call POST /api/sites/my-docs/process repeatedly to finish faster."
 }
@@ -121,9 +126,9 @@ curl -X POST "$WORKER_URL/api/sites/index" \
 
 ## `POST /api/sites/:siteId/process`
 
-Crawl, chunk, embed and store the next `INDEX_BATCH_SIZE` pending pages for the site. Call repeatedly until `progress.pending` is `0`. The cron trigger performs the same work automatically once a minute.
+Claim, crawl, chunk, embed and store the next `INDEX_BATCH_SIZE` pending pages for the site. Call repeatedly until `progress.pending` and `progress.processing` are `0`. The cron trigger performs the same work automatically once a minute; claims are atomic, so concurrent calls never index the same page twice. `processed: 0` with pages left means the remaining pages are claimed by another invocation.
 
-**Response `200 OK`** (or `429` when Workers AI rate-limited the batch; remaining pages stay queued)
+**Response `200 OK`** (or `429` with the same body when Workers AI rate-limited the batch; unprocessed pages go back to the queue)
 
 ```json
 {
@@ -136,7 +141,7 @@ Crawl, chunk, embed and store the next `INDEX_BATCH_SIZE` pending pages for the 
     { "url": "https://docs.example.com/install", "status": "indexed", "title": "Installation", "chunks": 7 },
     { "url": "https://docs.example.com/old", "status": "failed", "error": "Failed to fetch https://docs.example.com/old: HTTP 404" }
   ],
-  "progress": { "siteId": "my-docs", "total": 142, "pending": 139, "indexed": 2, "failed": 1 }
+  "progress": { "siteId": "my-docs", "total": 142, "pending": 139, "processing": 0, "indexed": 2, "failed": 1 }
 }
 ```
 
@@ -152,7 +157,7 @@ Crawl, chunk, embed and store the next `INDEX_BATCH_SIZE` pending pages for the 
     "sitemap_url": "https://docs.example.com/sitemap.xml",
     "created_at": "2026-10-07 09:00:00"
   },
-  "progress": { "siteId": "my-docs", "total": 142, "pending": 0, "indexed": 140, "failed": 2 }
+  "progress": { "siteId": "my-docs", "total": 142, "pending": 0, "processing": 0, "indexed": 140, "failed": 2 }
 }
 ```
 
@@ -254,7 +259,7 @@ data: {"id":"6f1c…"}
 | `done`  | `{ id }`            | Stream finished normally.                                |
 | `error` | `{ message }`       | Emitted instead of `done` if generation was interrupted. |
 
-HTTP-level failures (400/403/404/429) are returned as normal JSON error responses before any event is sent.
+HTTP-level failures (400/403/404/429/502) are returned as normal JSON error responses before any event is sent. The `error` event carries a generic message; the cause is in the Worker logs (`chat.stream_failed`).
 
 **Minimal client**
 
@@ -323,11 +328,12 @@ components:
       properties: { error: { type: string }, code: { type: string } }
     Progress:
       type: object
-      required: [siteId, total, pending, indexed, failed]
+      required: [siteId, total, pending, processing, indexed, failed]
       properties:
         siteId: { type: string }
         total: { type: integer }
         pending: { type: integer }
+        processing: { type: integer }
         indexed: { type: integer }
         failed: { type: integer }
     PageResult:
@@ -404,7 +410,7 @@ paths:
               properties:
                 siteId: { type: string }
                 sitemapUrl: { type: string, format: uri }
-                domain: { type: string }
+                domain: { type: string, description: 'Hostname or *.wildcard; defaults to the registered domain, then the sitemap host' }
                 process: { type: boolean, default: false }
       responses:
         '202': { description: Site registered, pages queued }
@@ -418,7 +424,7 @@ paths:
       parameters: [{ name: siteId, in: path, required: true, schema: { type: string } }]
       responses:
         '200': { description: Batch processed, content: { application/json: { schema: { $ref: '#/components/schemas/ProcessResult' } } } }
-        '429': { description: Workers AI rate limited; remaining pages stay queued }
+        '429': { description: Workers AI rate limited; unprocessed pages go back to the queue, content: { application/json: { schema: { $ref: '#/components/schemas/ProcessResult' } } } }
   /api/sites/{siteId}/status:
     get:
       summary: Indexing progress
@@ -460,7 +466,8 @@ paths:
             text/event-stream: { schema: { type: string } }
         '403': { description: Origin not allowed for this site }
         '404': { description: Unknown site }
-        '429': { description: Workers AI rate limited }
+        '429': { description: 'Rate limited: rate_limited (per client), daily_limit_reached (per site) or ai_rate_limited (Workers AI quota)' }
+        '502': { description: Workers AI error }
   /widget.js:
     get:
       summary: Embeddable widget script

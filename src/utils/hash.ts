@@ -10,11 +10,12 @@ export async function sha256Hex(input: string): Promise<string> {
 }
 
 /**
- * Deterministic page id derived from the URL so re-indexing the same URL
- * overwrites existing rows and vectors instead of duplicating them.
+ * Deterministic page id derived from the site and the URL, so re-indexing the same URL overwrites
+ * existing rows and vectors instead of duplicating them, while two sites that list the same URL get
+ * separate rows (and separate vector ids, which are derived from the page id).
  */
-export async function pageIdFor(url: string): Promise<string> {
-  return (await sha256Hex(url)).slice(0, 24);
+export async function pageIdFor(siteId: string, url: string): Promise<string> {
+  return (await sha256Hex(`${siteId}\n${url}`)).slice(0, 24);
 }
 
 /** Constant-time string comparison for tokens. */

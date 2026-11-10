@@ -1,3 +1,5 @@
 # Copy to .dev.vars for local development (`bunx wrangler dev`). Never commit .dev.vars.
 # Placeholder only - the Deploy to Cloudflare wizard prompts for this; replace it (e.g. `openssl rand -hex 32`).
+# This exact value (and any token shorter than 16 characters) is accepted on localhost only: a deployed
+# Worker answers 503 admin_token_weak until a real token is set.
 ADMIN_TOKEN=dev-token-change-me

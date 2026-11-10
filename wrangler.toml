@@ -3,17 +3,18 @@
 
 name = "docflare-ai"
 main = "src/index.ts"
-compatibility_date = "2024-09-25"
+compatibility_date = "2026-10-01"
 
 # Workers AI binding (embeddings + text generation). No API keys required.
 [ai]
 binding = "AI"
 
-# Vectorize index: 384 dimensions (bge-small-en-v1.5), cosine metric.
-# Create it with: bunx wrangler vectorize create docflare-index --dimensions=384 --metric=cosine
+# Vectorize index: 1024 dimensions (bge-m3, multilingual), cosine metric.
+# Create it with: bunx wrangler vectorize create docflare-index-m3 --dimensions=1024 --metric=cosine
+# (Deployments from before the bge-m3 switch used the 384-dim "docflare-index"; see README "Upgrading".)
 [[vectorize]]
 binding = "VECTOR_INDEX"
-index_name = "docflare-index"
+index_name = "docflare-index-m3"
 
 # D1 database for sites, pages and chat history.
 # Create it with: bunx wrangler d1 create docflare-db
@@ -25,6 +26,14 @@ database_name = "docflare-db"
 database_id = "REPLACE_WITH_YOUR_D1_ID"
 migrations_dir = "migrations"
 
+# Per-client burst limit for /api/chat (Workers Rate Limiting), keyed on siteId + client IP.
+# namespace_id is any integer string that is unique among the rate limiters in your account.
+# Counters are kept per Cloudflare location, so treat the limit as approximate.
+[[ratelimits]]
+name = "CHAT_RATE_LIMITER"
+namespace_id = "1001"
+simple = { limit = 20, period = 60 }
+
 # Static assets (widget.js, demo page). Served at the edge before the Worker runs.
 # Requests that do not match an asset (e.g. /api/*) fall through to the Worker.
 [assets]
@@ -33,6 +42,7 @@ binding = "ASSETS"
 not_found_handling = "none"
 
 # Background indexer: processes pending pages in small, free-tier-safe batches.
+# The same trigger deletes chat log rows older than QUERY_RETENTION_DAYS once an hour.
 [triggers]
 crons = ["* * * * *"]
 
@@ -49,9 +59,15 @@ INDEX_BATCH_SIZE = "3"
 TOP_K = "4"
 # Rerank the 20 best vector matches with @cf/baai/bge-reranker-base before picking TOP_K ("false" to disable).
 RERANK = "true"
+# Max answered questions per site in any rolling 24 hours ("0" = unlimited). Every site shares one
+# Workers AI quota (~120-280 answers/day on the Free plan); this keeps one site from using it all.
+DAILY_CHAT_LIMIT = "250"
+# Days of chat log (queries table) to keep; older rows are deleted hourly ("0" = keep forever).
+QUERY_RETENTION_DAYS = "90"
 
 # Secrets (set with `bunx wrangler secret put <NAME>`, never commit them):
-#   ADMIN_TOKEN - bearer token required by the /api/sites/* management endpoints.
+#   ADMIN_TOKEN - bearer token required by the /api/sites/* management endpoints. At least 16 characters;
+#                 the .dev.vars.example value only works on localhost.
 
 [observability]
 enabled = true

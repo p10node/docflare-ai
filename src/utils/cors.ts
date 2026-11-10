@@ -24,6 +24,24 @@ export function parseAllowedOrigins(raw: string | undefined): string[] {
     .filter(Boolean);
 }
 
+const HOST_LABEL = '[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?';
+const DOMAIN_PATTERN = new RegExp(`^(?:\\*\\.)?(?:${HOST_LABEL}\\.)*${HOST_LABEL}$`);
+
+/**
+ * Normalize a site domain: "https://Docs.Example.com/path" -> "docs.example.com"; "*.example.com" is
+ * kept as a wildcard. Returns null for anything that is not a plain hostname, e.g. "", "https://",
+ * "a..b" or "example.com." (an empty domain would block the widget everywhere and let the crawler
+ * accept any trailing-dot host).
+ */
+export function normalizeDomain(raw: string): string | null {
+  const domain = raw
+    .trim()
+    .toLowerCase()
+    .replace(/^https?:\/\//, '')
+    .replace(/[/:?#].*$/, '');
+  return domain.length <= 253 && DOMAIN_PATTERN.test(domain) ? domain : null;
+}
+
 /** Build the CORS response headers for a given request Origin. */
 export function buildCorsHeaders(origin: string | null): Record<string, string> {
   return {

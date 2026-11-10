@@ -14,9 +14,10 @@ const MAX_PAGE_TEXT_CHARS = 200_000;
 const MIN_PAGE_TEXT_CHARS = 40;
 
 /**
- * Chunk budget in (estimated) embedding-model tokens. bge-small reads at most 512 tokens; the page
- * title and description are prepended to the embedding input (see indexer.ts), so chunks stay well
- * below that. Smaller, topic-focused chunks also retrieve better than long mixed ones.
+ * Chunk budget in estimated tokens. The embedding model (bge-m3) reads up to 8k tokens, so the budget
+ * comes from retrieval and prompt size instead: small, topic-focused chunks retrieve better than long
+ * mixed ones, and TOP_K chunks of this size keep the LLM prompt (the main Workers AI cost) small. It
+ * also stays under bge-small's 512-token window together with the title/description caps in indexer.ts.
  */
 export const CHUNK_TOKENS = 350;
 export const CHUNK_OVERLAP_TOKENS = 40;
@@ -156,11 +157,23 @@ function extractLocs(xml: string): string[] {
   return locs;
 }
 
-/** True when the hostname belongs to the allowed site (same host or a subdomain of it). */
+/**
+ * True when the hostname belongs to the allowed site (same host or a subdomain of it). A wildcard site
+ * domain ("*.example.com") covers the apex and every subdomain, like the widget origin check.
+ */
 export function isSameSite(hostname: string, allowedHost: string): boolean {
   const host = hostname.toLowerCase();
-  const allowed = allowedHost.toLowerCase().replace(/^www\./, '');
-  return host === allowed || host === 'www.' + allowed || host.endsWith('.' + allowed);
+  const allowed = allowedHost.toLowerCase().replace(/^\*\./, '').replace(/^www\./, '');
+  if (!allowed) return false;
+  return host === allowed || host.endsWith('.' + allowed);
+}
+
+function hostnameOf(url: string): string | null {
+  try {
+    return new URL(url).hostname;
+  } catch {
+    return null;
+  }
 }
 
 /** Normalize a candidate page URL or return null when it should not be crawled. */
@@ -251,9 +264,16 @@ export function cleanText(raw: string): string {
 /**
  * Download a page and extract its readable text using HTMLRewriter (streaming, native, CPU-cheap).
  * Navigation, headers, footers, scripts and styles are dropped; headings become `## Title` lines.
+ * With `allowedHost`, a page that redirects to another site is rejected instead of being indexed
+ * under the original URL.
  */
-export async function extractPage(url: string): Promise<ExtractedPage> {
+export async function extractPage(url: string, allowedHost?: string): Promise<ExtractedPage> {
   const res = await fetchWithTimeout(url, 'text/html,application/xhtml+xml;q=0.9,*/*;q=0.5');
+  const finalHost = res.url ? hostnameOf(res.url) : null;
+  if (allowedHost && finalHost && !isSameSite(finalHost, allowedHost)) {
+    await res.body?.cancel();
+    throw new CrawlError(`Skipped ${url}: redirected off-site to ${res.url}`);
+  }
   const contentType = res.headers.get('Content-Type') ?? '';
   if (contentType && !/html|xhtml/i.test(contentType)) {
     throw new CrawlError(`Skipped ${url}: not an HTML document (${contentType})`);
@@ -367,10 +387,11 @@ export async function extractPage(url: string): Promise<ExtractedPage> {
 // ---------------------------------------------------------------------------
 
 /**
- * Cheap upper-bound estimate of bge-small (BERT WordPiece) tokens, calibrated on English, Vietnamese
- * and code: ~4.5 chars per token for ASCII letters/digits/spaces, ~0.7 for ASCII punctuation, and one
- * token per non-ASCII character (accented letters and CJK are split into word pieces). Always a
- * slight over-estimate so chunks never exceed the model's 512-token window.
+ * Cheap upper-bound token estimate, calibrated on BERT WordPiece counts for English, Vietnamese and
+ * code: ~4.5 chars per token for ASCII letters/digits/spaces, ~0.7 for ASCII punctuation, and one
+ * token per non-ASCII character (accented letters and CJK are split into word pieces). bge-m3's and
+ * Llama's tokenizers handle accented and CJK text more efficiently, so the estimate errs on the high
+ * side there: Vietnamese/CJK chunks come out somewhat shorter than English ones, never longer.
  */
 export function estimateTokens(text: string): number {
   let word = 0;

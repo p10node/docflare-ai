@@ -17,6 +17,8 @@ export interface RegisterResult {
   sitemapUrl: string;
   /** URLs discovered in the sitemap and queued for crawling. */
   queued: number;
+  /** Previously indexed pages no longer listed in the sitemap; their rows and vectors were deleted. */
+  removed: number;
 }
 
 export interface PageResult {
@@ -36,7 +38,19 @@ export interface ProcessResult {
   results: PageResult[];
 }
 
-/** Register (or refresh) a site and enqueue every HTML URL found in its sitemap. */
+/**
+ * A claimed page stays "processing" this long before another invocation may claim it again. Matches
+ * the longest a cron invocation can run, so a live invocation never loses its pages.
+ */
+export const LEASE_MINUTES = 15;
+/**
+ * Claims allowed per page. Every claim counts, and a page is only re-claimed when the invocation that
+ * held it died without recording a result (CPU, memory or time limit), so this is the number of times
+ * a page may kill the Worker before it is marked failed.
+ */
+export const MAX_ATTEMPTS = 3;
+
+/** Register (or refresh) a site, enqueue every HTML URL in its sitemap and drop pages it no longer lists. */
 export async function registerSite(
   env: Env,
   siteId: string,
@@ -48,16 +62,29 @@ export async function registerSite(
   const urls = await fetchSitemapUrls(sitemapUrl, { allowedHost: domain, maxUrls: maxPages });
 
   await db.upsertSite(siteId, domain, sitemapUrl);
-  const pages = await Promise.all(urls.map(async (url) => ({ id: await pageIdFor(url), url })));
+  const pages = await Promise.all(urls.map(async (url) => ({ id: await pageIdFor(siteId, url), url })));
   await db.enqueuePages(siteId, pages);
+  const removed = await pruneRemovedPages(env, db, siteId, new Set(urls));
 
-  return { siteId, domain, sitemapUrl, queued: pages.length };
+  return { siteId, domain, sitemapUrl, queued: pages.length, removed };
 }
 
 /**
- * Token budget for the title / description prepended to embedding inputs. Together with CHUNK_TOKENS
- * (350) this keeps every embedding input under bge-small's 512-token window, also for Vietnamese or
- * CJK titles that tokenize into many word pieces.
+ * Delete the pages of a site whose URL is not in `keep` (removed from the sitemap, or past MAX_PAGES),
+ * vectors first so a failure leaves the rows in place for the next re-crawl to retry.
+ */
+async function pruneRemovedPages(env: Env, db: Db, siteId: string, keep: Set<string>): Promise<number> {
+  const stale = (await db.listPages(siteId)).filter((page) => !keep.has(page.url));
+  if (stale.length === 0) return 0;
+  await deletePagesVectors(env.VECTOR_INDEX, stale);
+  await db.deletePages(stale.map((page) => page.id));
+  return stale.length;
+}
+
+/**
+ * Token caps for the title / description prepended to embedding inputs, so they add context without
+ * drowning out the chunk's own text. Together with CHUNK_TOKENS (350) inputs also stay under 512
+ * tokens, the window of the smaller BGE models.
  */
 const EMBED_TITLE_TOKENS = 40;
 const EMBED_DESCRIPTION_TOKENS = 80;
@@ -75,7 +102,7 @@ export interface ChunkRecord {
  * The meta description is prepended to the first chunk and the page title to every embedding input:
  * landing/about copy rarely spells out the site name, so without this "what is <site>?" retrieves the
  * legal pages (which do) instead of the About page. The stored text keeps the full description; the
- * embedding input gets token-capped copies so the chunk itself is never truncated by the model.
+ * embedding input gets token-capped copies so they never outweigh the chunk text.
  */
 export function buildChunkRecords(page: ExtractedPage, chunks: TextChunk[]): ChunkRecord[] {
   const description = page.description.trim();
@@ -89,9 +116,13 @@ export function buildChunkRecords(page: ExtractedPage, chunks: TextChunk[]): Chu
   });
 }
 
-/** Crawl, chunk, embed and store a single page. */
-export async function indexPage(env: Env, page: PageRow): Promise<{ title: string; chunks: number }> {
-  const extracted = await extractPage(page.url);
+/** Crawl, chunk, embed and store a single page. `allowedHost` rejects redirects to other sites. */
+export async function indexPage(
+  env: Env,
+  page: PageRow,
+  allowedHost?: string,
+): Promise<{ title: string; chunks: number }> {
+  const extracted = await extractPage(page.url, allowedHost);
   const chunks = chunkText(extracted.text);
   if (chunks.length === 0) throw new Error('No text chunks produced');
 
@@ -125,8 +156,9 @@ export async function indexPage(env: Env, page: PageRow): Promise<{ title: strin
 }
 
 /**
- * Process the next batch of pending pages (for one site, or across all sites when siteId is null).
- * Failures are recorded per page; a Workers AI rate limit stops the batch and leaves pages queued.
+ * Claim and process the next batch of pending pages (for one site, or across all sites when siteId is
+ * null). Failures are recorded per page; a Workers AI rate limit stops the batch and hands the
+ * unprocessed pages back to the queue.
  */
 export async function processPendingPages(
   env: Env,
@@ -134,19 +166,32 @@ export async function processPendingPages(
   batchSize: number,
 ): Promise<ProcessResult> {
   const db = new Db(env.DB);
-  const pages = await db.nextPending(siteId, batchSize);
+  const pages = await db.claimPending(siteId, batchSize, LEASE_MINUTES);
   const result: ProcessResult = { processed: 0, indexed: 0, failed: 0, rateLimited: false, results: [] };
+  const domains = new Map<string, string | undefined>();
+  const domainOf = async (id: string) => {
+    if (!domains.has(id)) domains.set(id, (await db.getSite(id))?.domain);
+    return domains.get(id);
+  };
 
-  for (const page of pages) {
+  for (let i = 0; i < pages.length; i++) {
+    const page = pages[i] as PageRow;
     try {
-      const { title, chunks } = await indexPage(env, page);
+      if (page.attempts > MAX_ATTEMPTS) {
+        throw new Error(
+          `Gave up after ${MAX_ATTEMPTS} attempts: the Worker was stopped while indexing this page ` +
+            '(CPU, memory or time limit). Re-crawl the sitemap to retry.',
+        );
+      }
+      const { title, chunks } = await indexPage(env, page, await domainOf(page.site_id));
       await db.markPageIndexed(page.id, title, chunks);
       result.indexed++;
       result.results.push({ url: page.url, status: 'indexed', title, chunks });
     } catch (err) {
       if (err instanceof AiRateLimitError) {
-        // Leave the page queued; the next cron tick will retry it.
+        // Hand this page and the rest of the batch back; the next cron tick retries them.
         result.rateLimited = true;
+        await db.releasePages(pages.slice(i).map((p) => p.id));
         console.warn(JSON.stringify({ event: 'index.rate_limited', url: page.url }));
         break;
       }

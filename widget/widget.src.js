@@ -104,7 +104,8 @@
 
     function paint() { if (!sawToken) { sawToken = true; bot.className = 'b t'; } bot.innerHTML = md(text, src); msgs.scrollTop = msgs.scrollHeight; }
     function finish(err) {
-      if (err) { bot.className = 'b t e'; bot.textContent = err; }
+      // Drop the unanswered question so the next request does not send two user turns in a row.
+      if (err) { hist.pop(); bot.className = 'b t e'; bot.textContent = err; }
       else { if (!text) text = '(no answer)'; paint(); hist.push({ role: 'assistant', content: text }); showSources(src); }
       setBusy(false); ta.focus();
     }
@@ -164,5 +165,9 @@
   document.body ? mount() : document.addEventListener('DOMContentLoaded', mount);
 
   // Public API: window.DocFlare.open() / close() / ask('question')
-  window.DocFlare = { open: function () { toggle(true); }, close: function () { toggle(false); }, ask: function (q) { toggle(true); ask(String(q)); } };
+  window.DocFlare = {
+    open: function () { toggle(true); },
+    close: function () { toggle(false); },
+    ask: function (q) { q = String(q == null ? '' : q).trim(); toggle(true); if (q && !busy) ask(q); }
+  };
 })();

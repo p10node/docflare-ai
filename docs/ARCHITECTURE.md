@@ -27,7 +27,7 @@ This document explains how the pieces fit together, why the design looks the way
 
 ```toml
 [ai]              binding = "AI"            # Workers AI
-[[vectorize]]     binding = "VECTOR_INDEX"  # 384-dim cosine index "docflare-index"
+[[vectorize]]     binding = "VECTOR_INDEX"  # 1024-dim cosine index "docflare-index-m3"
 [[d1_databases]]  binding = "DB"            # "docflare-db"
 [assets]          binding = "ASSETS"        # ./public
 [triggers]        crons = ["* * * * *"]     # background indexer
@@ -66,11 +66,11 @@ erDiagram
     }
 ```
 
-The `pages` table doubles as the **indexing queue**: `status = 'pending'` rows are picked up oldest-first by the cron handler. Page ids are deterministic (hash of the URL), so re-indexing is idempotent and vector ids (`<pageId>-<chunkIndex>`) can be reconstructed for deletion without storing them.
+The `pages` table doubles as the **indexing queue**: `status = 'pending'` rows are picked up oldest-first by the cron handler. Page ids are deterministic (hash of the site id and the URL), so re-indexing is idempotent, two sites can list the same URL and vector ids (`<pageId>-<chunkIndex>`) can be reconstructed for deletion without storing them.
 
 ## Vector layout (Vectorize)
 
-- Index: 384 dimensions, cosine metric, matching `@cf/baai/bge-small-en-v1.5`.
+- Index: 1024 dimensions, cosine metric, matching `@cf/baai/bge-m3` (multilingual, so a question in one language can match pages in another).
 - **One namespace per site** (`namespace = siteId`). Queries are scoped with `{ namespace }`, which gives hard tenant isolation without creating a metadata index for filtering.
 - Vector id: `<pageId>-<chunkIndex>`.
 - Metadata (flat, < 10 KiB): `siteId`, `pageId`, `url`, `title`, `chunk`, `text`. Storing the chunk text in metadata means the chat path needs **no D1 read** to build the prompt.
@@ -97,13 +97,13 @@ sequenceDiagram
 
     loop every minute (cron) or POST /api/sites/:id/process
         CR->>W: scheduled()
-        W->>D1: SELECT pending pages LIMIT INDEX_BATCH_SIZE
+        W->>D1: claim pending pages (UPDATE … status='processing' RETURNING, LIMIT INDEX_BATCH_SIZE)
         loop for each page
             W->>SM: GET page.html
             W->>W: HTMLRewriter: drop nav/header/footer/script/style, collect text
             W->>W: chunk ~350 tokens at headings/sentences, 40 overlap
-            W->>AI: bge-small-en-v1.5 (batch of chunks)
-            AI-->>W: 384-dim vectors
+            W->>AI: bge-m3 (batch of chunks)
+            AI-->>W: 1024-dim vectors
             W->>VX: upsert {id, values, namespace, metadata}
             W->>D1: UPDATE pages SET status='indexed', chunk_count, title
         end
@@ -116,8 +116,11 @@ The Workers Free plan caps CPU time at 10 ms per invocation. HTML parsing, chunk
 
 - `POST /api/sites/index` only parses the sitemap and writes the queue (cheap).
 - Each cron tick or `/process` call handles `INDEX_BATCH_SIZE` pages (default 3) and returns. Network waits (fetching pages, calling Workers AI, Vectorize) do not count as CPU time.
+- Pages are claimed with one atomic `UPDATE … RETURNING` (`status = 'processing'`, `attempts + 1`), so the cron trigger, `/process` calls and the admin UI's **Index all** loop never crawl the same page twice.
 - Failures are recorded per page (`status = 'failed'`, `error`) and never block the rest of the queue.
-- A Workers AI rate limit stops the current batch early and leaves the remaining pages `pending`; the next tick retries them.
+- An invocation killed mid-batch (CPU, memory or time limit) cannot record anything. Its pages stay `processing` until the 15-minute lease expires and are then claimed again; after 3 such claims a page is marked `failed`, so one bad page cannot stall the queue.
+- A Workers AI rate limit stops the current batch early and hands the unprocessed pages back (`pending`, attempt not counted); the next tick retries them.
+- Re-indexing a site deletes the pages (and vectors) that are no longer in its sitemap.
 
 Cloudflare Queues would be the "proper" tool but are not available on the Free plan; the D1-backed queue costs nothing extra and is trivially inspectable with `wrangler d1 execute`.
 
@@ -133,9 +136,9 @@ Cloudflare Queues would be the "proper" tool but are not available on the Free p
 
 ### Chunking
 
-Chunks target ~350 tokens with ~40 tokens of overlap. Sizes are measured with `estimateTokens`, a cheap upper bound of bge-small's WordPiece count (≈4.5 ASCII letters per token, ≈0.7 punctuation characters per token, one token per non-ASCII character). A fixed characters-per-token ratio does not work across scripts: Vietnamese runs at 2.3-3 characters per token, so 1,800-character chunks were silently truncated by the model's 512-token window and their tails were never searchable.
+Chunks target ~350 tokens with ~40 tokens of overlap. bge-m3 reads up to 8k tokens, so this budget comes from retrieval quality (small, topic-focused chunks win) and prompt size (`TOP_K` chunks go to the LLM, the main Workers AI cost), not from the model window. Sizes are measured with `estimateTokens`, a cheap upper bound calibrated on BERT WordPiece counts (≈4.5 ASCII letters per token, ≈0.7 punctuation characters per token, one token per non-ASCII character); bge-m3 and Llama tokenize accented and CJK text more efficiently, so those chunks come out somewhat shorter, never longer. A fixed characters-per-token ratio does not work across scripts: Vietnamese runs at 2.3-3 characters per token under WordPiece, and with the earlier 512-token bge-small model 1,800-character chunks were silently truncated.
 
-Text is split into paragraphs and sentences; units are greedily packed into a chunk, and the trailing sentences of each chunk are carried into the next one as overlap. A heading line (`## …`) starts a new chunk (without overlap) as soon as the current chunk holds `SECTION_MIN_TOKENS` (80), so a chunk rarely mixes unrelated sections of a landing page. Oversized units (long code blocks) are hard-split. The page title and meta description are prepended to the embedding input with their own token caps (40 / 80), keeping every input under 512 tokens.
+Text is split into paragraphs and sentences; units are greedily packed into a chunk, and the trailing sentences of each chunk are carried into the next one as overlap. A heading line (`## …`) starts a new chunk (without overlap) as soon as the current chunk holds `SECTION_MIN_TOKENS` (80), so a chunk rarely mixes unrelated sections of a landing page. Oversized units (long code blocks) are hard-split. The page title and meta description are prepended to the embedding input with their own token caps (40 / 80), so they add context without drowning out the chunk text (and inputs stay under 512 tokens should you switch back to a smaller BGE model).
 
 ## Chat flow
 
@@ -152,8 +155,8 @@ sequenceDiagram
     W->>W: validate payload, normalise siteId
     W->>D1: SELECT site
     W->>W: Origin must match site.domain (or ALLOWED_ORIGINS)
-    W->>AI: embed question (bge-small-en-v1.5)
-    AI-->>W: 384-dim vector
+    W->>AI: embed question (bge-m3)
+    AI-->>W: 1024-dim vector
     W->>VX: query(vector, {namespace: siteId, topK: 20, returnMetadata: "all"})
     VX-->>W: 20 candidate chunks with url/title/text
     W->>AI: bge-reranker-base (question + 20 passages)
@@ -203,15 +206,15 @@ The full answer is accumulated while streaming and written to D1 after the strea
 
 ## Multi-tenancy and security
 
-| Concern                       | Mechanism                                                                                                                                                                                                                                                                                                                       |
-|-------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
-| Tenant isolation in search    | Vectorize namespace per `siteId`                                                                                                                                                                                                                                                                                                |
-| Who may embed the widget      | `/api/chat` compares the request `Origin` hostname with `sites.domain` (exact, `www.` variant, or `*.wildcard`), plus the `ALLOWED_ORIGINS` allow-list. Requests without an `Origin` (curl, server-side) are allowed.                                                                                                           |
-| Who may index / delete        | `/api/sites/*` requires `Authorization: Bearer <ADMIN_TOKEN>`; compared in constant time. Routes return `503` if the secret is unset so a fresh deployment is never open by accident. The admin page is plain static HTML; it only becomes useful once a valid token is pasted in (kept in `sessionStorage`, never in the URL). |
-| SSRF / crawling third parties | Only `http(s)` URLs whose hostname is the site's domain (or a subdomain) are queued; child sitemaps are held to the same rule.                                                                                                                                                                                                  |
-| Abuse of the LLM              | Questions capped at 1,000 characters, history at 10 turns; no context → no LLM call.                                                                                                                                                                                                                                            |
-| CORS                          | Preflights reflect the `Origin`; the real policy is enforced per site after the body is parsed (the site id is not known at preflight time).                                                                                                                                                                                    |
-| Widget isolation              | Shadow DOM with `all: initial` on the host; nothing leaks in or out.                                                                                                                                                                                                                                                            |
+| Concern                       | Mechanism                                                                                                                                                                                                                                                                                                                                                                                                                                                     |
+|-------------------------------|---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------|
+| Tenant isolation in search    | Vectorize namespace per `siteId`                                                                                                                                                                                                                                                                                                                                                                                                                              |
+| Who may embed the widget      | `/api/chat` compares the request `Origin` hostname with `sites.domain` (exact, `www.` variant, or `*.wildcard`), plus the `ALLOWED_ORIGINS` allow-list. Requests without an `Origin` (curl, server-side) are allowed; the rate limits below are what bounds them.                                                                                                                                                                                             |
+| Who may index / delete        | `/api/sites/*` requires `Authorization: Bearer <ADMIN_TOKEN>`; compared in constant time. Routes return `503` if the secret is unset, shorter than 16 characters or the `.dev.vars.example` value (which the Deploy button pre-fills; accepted on localhost only), so a fresh deployment is never open by accident. The admin page is plain static HTML; it only becomes useful once a valid token is pasted in (kept in `sessionStorage`, never in the URL). |
+| SSRF / crawling third parties | Only `http(s)` URLs whose hostname is the site's domain (or a subdomain) are queued; child sitemaps are held to the same rule, and a page whose redirects end on another site is rejected. Site domains must be plain hostnames or `*.wildcards`.                                                                                                                                                                                                             |
+| Abuse of the LLM              | Per site + client IP burst limit (Workers Rate Limiting binding `CHAT_RATE_LIMITER`), per-site `DAILY_CHAT_LIMIT` so one site cannot drain the shared Workers AI quota, questions capped at 1,000 characters, history at 10 turns; no context → no LLM call. Workers AI error details stay in the logs.                                                                                                                                                       |
+| CORS                          | Preflights reflect the `Origin`; the real policy is enforced per site after the body is parsed (the site id is not known at preflight time).                                                                                                                                                                                                                                                                                                                  |
+| Widget isolation              | Shadow DOM with `all: initial` on the host; nothing leaks in or out.                                                                                                                                                                                                                                                                                                                                                                                          |
 
 ## Free-tier guardrails summary
 
@@ -219,12 +222,12 @@ The full answer is accumulated while streaming and written to D1 after the strea
 |------------------------|-----------------------------------------------------------------------------------------------------------------------------------------|
 | 10 ms CPU / invocation | Small crawl batches, native `HTMLRewriter`, chunk text stored in vector metadata (no joins at query time)                               |
 | 10k neurons / day      | Cheap embedding model, LLM skipped when retrieval is empty, `max_tokens` capped at 768, rate limits surfaced as `429` and retried later |
-| 5M stored dimensions   | 384-dim model (~13k chunks); `MAX_PAGES` caps each site                                                                                 |
-| D1 writes              | One write per page per crawl, one per chat                                                                                              |
+| 5M stored dimensions   | 1024-dim model (~4.9k chunks); `MAX_PAGES` caps each site                                                                               |
+| D1 writes              | One write per page per crawl, one per chat; chat log pruned after `QUERY_RETENTION_DAYS`                                                |
 
 ## Observability
 
-Structured JSON lines are logged for batches (`index.batch`), page failures (`index.page_failed`), rate limits (`index.rate_limited`) and unhandled errors. With `[observability] enabled = true` they are visible in the Cloudflare dashboard's Workers Logs. `GET /api/sites/:siteId/status` exposes queue counts, and the `queries` table is the analytics source for "what are people asking".
+Structured JSON lines are logged for batches (`index.batch`), page failures (`index.page_failed`), rate limits (`index.rate_limited`), chat log retention (`queries.pruned`), interrupted answers (`chat.stream_failed`), Workers AI errors (`ai_error`) and unhandled errors. With `[observability] enabled = true` they are visible in the Cloudflare dashboard's Workers Logs. `GET /api/sites/:siteId/status` exposes queue counts, and the `queries` table is the analytics source for "what are people asking".
 
 ## Extension points
 
